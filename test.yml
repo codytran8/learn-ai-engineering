@@ -1,0 +1,140 @@
+---
+- name: Complex IOS-XE Firmware Upgrade with Automated Rollback
+  hosts: cisco_switches
+  gather_facts: false
+  connection: network_cli
+  serial: 1 # Upgrades one switch at a time to maintain network stability
+  
+  vars:
+    target_version: "17.09.03"
+    new_image: "cat9k_iosxe.17.09.03.SPA.bin"
+    scp_server: "10.0.0.50"
+    scp_user: "scp_admin"
+    scp_pass: "ScpPassword123!"
+
+  tasks:
+    # ---------------------------------------------------------
+    # PHASE 1: PRE-CHECKS
+    # ---------------------------------------------------------
+    - name: Gather current facts (Version, Model, Serial)
+      cisco.ios.ios_facts:
+        gather_subset:
+          - hardware
+
+    - name: STOP if switch is already on target version
+      ansible.builtin.meta: end_host
+      when: ansible_net_version == target_version
+
+    - name: Save current running image name for rollback purposes
+      ansible.builtin.set_fact:
+        rollback_image: "{{ ansible_net_image | basename }}"
+
+    - name: Verify sufficient free space in flash
+      cisco.ios.ios_command:
+        commands: "dir flash:"
+      register: flash_space
+
+    # ---------------------------------------------------------
+    # PHASE 2: UPGRADE & ROLLBACK LOGIC
+    # ---------------------------------------------------------
+    - name: BLOCK - Execute Upgrade Process
+      block:
+        - name: Copy new image via SCP (Requires 'ip scp server enable' on switch)
+          ansible.builtin.command: >
+            sshpass -p '{{ scp_pass }}' scp -o StrictHostKeyChecking=no 
+            {{ scp_user }}@{{ scp_server }}:/images/{{ new_image }} ./
+          args:
+            creates: "./{{ new_image }}"
+          delegate_to: localhost
+          changed_when: false
+
+        - name: Upload image to switch flash via Ansible Network CLI
+          ansible.netcommon.net_put:
+            src: "./{{ new_image }}"
+            dest: "flash:/{{ new_image }}"
+          vars:
+            ansible_command_timeout: 1200 # 20 minute timeout for large file copy
+
+        - name: Change boot variable to new image
+          cisco.ios.ios_config:
+            lines:
+              - "no boot system flash"
+              - "boot system flash:{{ new_image }}"
+
+        - name: Save running configuration
+          cisco.ios.ios_command:
+            commands: "write memory"
+
+        - name: Reload the switch
+          cisco.ios.ios_command:
+            commands: "reload"
+          ignore_errors: true # Expected: Connection will drop
+
+        - name: Wait for switch to come back online (Wait for SSH port 22)
+          ansible.builtin.wait_for:
+            host: "{{ ansible_host }}"
+            port: 22
+            delay: 60
+            timeout: 900 # Wait up to 15 minutes for boot
+          delegate_to: localhost
+
+        - name: Re-gather facts after reload
+          cisco.ios.ios_facts:
+            gather_subset: hardware
+
+        - name: FAIL if new version is not running
+          ansible.builtin.fail:
+            msg: "Switch rebooted but is still on {{ ansible_net_version }}! Rollback triggered."
+          when: ansible_net_version != target_version
+
+      # ---------------------------------------------------------
+      # RESCUE: AUTOMATED ROLLBACK IF UPGRADE FAILS
+      # ---------------------------------------------------------
+      rescue:
+        - name: RESCUE - Attempting rollback to {{ rollback_image }}
+          ansible.builtin.debug:
+            msg: "Upgrade failed. Reverting boot variable to {{ rollback_image }}"
+
+        - name: Change boot variable back to old image
+          cisco.ios.ios_config:
+            lines:
+              - "no boot system flash"
+              - "boot system flash:{{ rollback_image }}"
+          register: rollback_result
+          ignore_errors: true
+
+        - name: Save config before rollback reload
+          cisco.ios.ios_command:
+            commands: "write memory"
+          ignore_errors: true
+
+        - name: Reload switch to boot old image
+          cisco.ios.ios_command:
+            commands: "reload"
+          ignore_errors: true
+
+        - name: Wait for switch to come back online on old image
+          ansible.builtin.wait_for:
+            host: "{{ ansible_host }}"
+            port: 22
+            delay: 60
+            timeout: 900
+          delegate_to: localhost
+
+        - name: Verify rollback was successful
+          cisco.ios.ios_facts:
+            gather_subset: hardware
+
+        - name: Hard fail the playbook if rollback succeeded
+          ansible.builtin.fail:
+            msg: "Upgrade failed, but successfully rolled back to {{ ansible_net_version }}. Human intervention required."
+
+      # ---------------------------------------------------------
+      # ALWAYS: CLEAN UP
+      # ---------------------------------------------------------
+      always:
+        - name: Delete downloaded image from local Ansible machine
+          ansible.builtin.file:
+            path: "./{{ new_image }}"
+            state: absent
+          delegate_to: localhost
